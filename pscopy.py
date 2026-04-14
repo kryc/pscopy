@@ -45,6 +45,7 @@ DUMP_EXTENSIONS = (".bin", ".cue", ".toc", ".iso")
 
 def sanitize_filename(name):
     name = name.replace(" & ", " And ")
+    name = name.replace("'", "")
     return UNSAFE_CHARS.sub("-", name)
 
 
