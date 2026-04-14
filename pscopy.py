@@ -480,7 +480,7 @@ def _preview_resolve(tui, text):
             return info["title"]
     if re.match(r"^\d{5}$", candidate) and tui.last_region:
         prefixes = tui.db.execute(
-            "SELECT DISTINCT substr(serial, 1, 5) || '-' FROM games WHERE region = ?",
+            "SELECT DISTINCT substr(serial, 1, 4) || '-' FROM games WHERE region = ?",
             (tui.last_region,),
         ).fetchall()
         for (prefix,) in prefixes:
@@ -784,7 +784,7 @@ def resolve_user_input(tui, user_input):
     if re.match(r"^\d{5}$", user_input) and tui.last_region:
         digits = user_input
         prefixes = tui.db.execute(
-            "SELECT DISTINCT substr(serial, 1, 5) || '-' FROM games WHERE region = ?",
+            "SELECT DISTINCT substr(serial, 1, 4) || '-' FROM games WHERE region = ?",
             (tui.last_region,),
         ).fetchall()
         for (prefix,) in prefixes:
