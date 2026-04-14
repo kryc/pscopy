@@ -33,6 +33,12 @@ ANSI_ESC_RE = re.compile(
     r'\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07]*\x07|\([B0UK]|\)[B0UK]|[>=<])'
     r'|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]'
 )
+# Orphaned CSI fragments (ESC was split off at a line boundary)
+ORPHAN_CSI_RE = re.compile(
+    r'\[[\d;]*[A-Za-z]'
+    r'|[\d;]{2,}[HfABCDJKSTm]'
+    r'|\?\d+[hl]'
+)
 
 TEMP_BASE = "_pscopy_temp"
 LOG_DIR = os.path.expanduser("~/.pscopy")
@@ -77,7 +83,9 @@ def normalize_serial(text):
 
 def clean_line(raw_bytes):
     """Decode raw bytes and strip ANSI escapes / control characters."""
-    return ANSI_ESC_RE.sub("", raw_bytes.decode("utf-8", errors="replace")).strip()
+    text = ANSI_ESC_RE.sub("", raw_bytes.decode("utf-8", errors="replace"))
+    text = ORPHAN_CSI_RE.sub("", text)
+    return text.strip()
 
 
 def cleanup_temp_files(output_dir):
@@ -613,18 +621,22 @@ def _run_monitored_process(tui, cmd, read_stderr, log_path, line_callback):
     Returns True if no errors detected.
     """
     errors_found = False
+    env = os.environ.copy()
+    env["TERM"] = "dumb"
 
     with open(log_path, "w") as logf:
         if read_stderr:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=0, stdin=subprocess.DEVNULL, start_new_session=True,
+                env=env,
             )
             read_fd = proc.stderr
         else:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 bufsize=0, stdin=subprocess.DEVNULL, start_new_session=True,
+                env=env,
             )
             read_fd = proc.stdout
 
