@@ -10,12 +10,16 @@ import select
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import warnings
 
 import pyudev
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 # Serial regex: covers SLUS/SCUS, SLES/SCES, SLPS/SCPS/SLPM/SCPM, etc.
-SERIAL_RE = re.compile(r"^S[LC][UEPM][SM]-\d{5}$", re.IGNORECASE)
+SERIAL_RE = re.compile(r"^S[LC][UEPM][SM]-?\d{5}$", re.IGNORECASE)
 # cdrdao progress: "Copying data track N (MODE): start MM:SS:FF, length MM:SS:FF"
 CDRDAO_TRACK_RE = re.compile(r"length\s+(\d+):(\d+):(\d+)")
 # cdrdao current position: "MM:SS:FF" at start of line (possibly with \r)
@@ -24,11 +28,14 @@ CDRDAO_POS_RE = re.compile(r"(\d+):(\d+):(\d+)")
 DD_BYTES_RE = re.compile(r"(\d+)\s+bytes")
 # Filesystem-unsafe characters
 UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
+# ANSI escape sequences and control characters
+ANSI_ESC_RE = re.compile(r'\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07]*\x07|\([B0UK]|\)[B0UK]|[>=<])|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 LOG_DIR = os.path.expanduser("~/.pscopy")
 
 
 def sanitize_filename(name):
+    name = name.replace(" & ", " And ")
     return UNSAFE_CHARS.sub("-", name)
 
 
@@ -72,9 +79,10 @@ class CursesTUI:
         self.progress_text = ""
         self.log_lines = []
         self.max_log = 50
-        self.input_prompt = ""
+        self.input_prompt = "Enter game code or custom title: "
         self.input_value = ""
         self.input_active = False
+        self.disc_name = ""
         self.db = sqlite3.connect(args.db)
         self.last_region = ""
         self._setup_colors()
@@ -86,7 +94,7 @@ class CursesTUI:
         curses.init_pair(self.COLOR_GOOD, curses.COLOR_GREEN, -1)
         curses.init_pair(self.COLOR_BAD, curses.COLOR_RED, -1)
         curses.init_pair(self.COLOR_WARN, curses.COLOR_YELLOW, -1)
-        curses.init_pair(self.COLOR_INPUT, curses.COLOR_CYAN, -1)
+        curses.init_pair(self.COLOR_INPUT, curses.COLOR_WHITE, curses.COLOR_BLACK)
 
     def set_status(self, text, color=None):
         self.status = text
@@ -114,7 +122,7 @@ class CursesTUI:
                 self.stdscr.refresh()
                 return
 
-            # Border
+            # Top section box
             title = " pscopy "
             self.stdscr.addstr(0, 0, "┌─" + title + "─" * (w - len(title) - 4) + "─┐")
 
@@ -126,8 +134,8 @@ class CursesTUI:
             self.stdscr.addstr(row, w - 1, "│")
             row += 1
 
-            # Device / Media
-            dev_media = f"Device: {self.device}         Media: {self.media}"
+            # Device / Media / Output
+            dev_media = f"Device: {self.device}         Media: {self.media}         Output: {self.args.output}"
             self.stdscr.addstr(row, 0, "│ ")
             self.stdscr.addstr(row, 2, dev_media[:w - 4])
             self.stdscr.addstr(row, w - 1, "│")
@@ -139,86 +147,109 @@ class CursesTUI:
             self.stdscr.addstr(row, w - 1, "│")
             row += 1
 
-            # Blank
-            self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
-            row += 1
-
-            # Progress bar
-            bar_width = w - 8  # margins for "│ [" + "] │"
-            if bar_width > 20:
+            # Progress bar inside top box
+            label = "Progress: "
+            bar_width = w - len(label) - 16
+            if bar_width > 10:
                 filled = int(self.progress * bar_width)
                 bar = "▓" * filled + "░" * (bar_width - filled)
                 pct = f" {self.progress * 100:5.1f}%"
                 pt = f"  {self.progress_text}" if self.progress_text else ""
-                line = f" [{bar}]{pct}{pt}"
-                self.stdscr.addstr(row, 0, "│")
-                self.stdscr.addstr(row, 1, line[:w - 3])
+                line = f"{label}[{bar}]{pct}{pt}"
+                self.stdscr.addstr(row, 0, "│ ")
+                self.stdscr.addstr(row, 2, line[:w - 4])
                 self.stdscr.addstr(row, w - 1, "│")
             else:
                 self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
             row += 1
 
-            # Blank
-            self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
+            # Close top section box
+            self.stdscr.addstr(row, 0, "└" + "─" * (w - 2) + "┘")
             row += 1
 
-            # Input area
-            if self.input_active and self.input_prompt:
-                inp = f" > {self.input_prompt}{self.input_value}"
-                self.stdscr.addstr(row, 0, "│")
-                self.stdscr.addstr(row, 1, inp[:w - 3],
-                                   curses.color_pair(self.COLOR_INPUT))
-                self.stdscr.addstr(row, w - 1, "│")
-            else:
-                self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
+            # Disc Input box
+            input_title = " Disc Input "
+            self.stdscr.addstr(row, 0, "┌─" + input_title + "─" * (w - len(input_title) - 4) + "─┐")
             row += 1
 
-            # Blank
-            self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
-            row += 1
-
-            # Log area header
+            # Prompt line (always visible)
+            prompt_text = self.input_prompt if self.input_prompt else "Enter game code or custom title: "
             self.stdscr.addstr(row, 0, "│ ")
-            self.stdscr.addstr(row, 2, "Log:", curses.A_UNDERLINE)
+            self.stdscr.addstr(row, 2, prompt_text[:w - 4])
             self.stdscr.addstr(row, w - 1, "│")
             row += 1
 
-            # Log lines — fill remaining space
-            log_rows = h - row - 1  # reserve 1 for bottom border
-            if log_rows > 0:
-                visible = self.log_lines[-log_rows:]
-                for i, line_text in enumerate(visible):
-                    if row + i >= h - 1:
-                        break
-                    self.stdscr.addstr(row + i, 0, "│  ")
-                    self.stdscr.addstr(row + i, 3, line_text[:w - 5])
-                    self.stdscr.addstr(row + i, w - 1, "│")
-                # Fill empty log rows
-                for i in range(len(visible), log_rows):
-                    if row + i >= h - 1:
-                        break
-                    self.stdscr.addstr(row + i, 0, "│" + " " * (w - 2) + "│")
+            # Input value line with highlight
+            input_text = f" > {self.input_value}"
+            pad = " " * max(0, w - 4 - len(input_text))
+            if self.input_active:
+                self.stdscr.addstr(row, 0, "│")
+                self.stdscr.addstr(row, 1, (input_text + pad)[:w - 3],
+                                   curses.color_pair(self.COLOR_INPUT) | curses.A_BOLD)
+                self.stdscr.addstr(row, w - 1, "│")
+            else:
+                self.stdscr.addstr(row, 0, "│" + (" " * (w - 2)) + "│")
+            row += 1
 
-            # Bottom border — writing to the last cell raises curses.error
-            # because the cursor can't advance past the screen, so catch it.
-            try:
-                self.stdscr.addstr(h - 1, 0, "└" + "─" * (w - 2) + "┘")
-            except curses.error:
-                pass
+            # Disc name line
+            disc_label = f"Disc name: {self.disc_name}" if self.disc_name else "Disc name:"
+            self.stdscr.addstr(row, 0, "│ ")
+            self.stdscr.addstr(row, 2, disc_label[:w - 4])
+            self.stdscr.addstr(row, w - 1, "│")
+            row += 1
+
+            # Close input box
+            self.stdscr.addstr(row, 0, "└" + "─" * (w - 2) + "┘")
+            row += 1
+
+            # Log box
+            log_title = " Log "
+            log_rows = h - row - 2  # reserve top border + bottom border
+            if log_rows < 1:
+                log_rows = 1
+            self.stdscr.addstr(row, 0, "┌─" + log_title + "─" * (w - len(log_title) - 4) + "─┐")
+            row += 1
+
+            visible = self.log_lines[-log_rows:]
+            for i in range(log_rows):
+                if row + i >= h - 1:
+                    break
+                if i < len(visible):
+                    self.stdscr.addstr(row + i, 0, "│ ")
+                    self.stdscr.addstr(row + i, 2, visible[i][:w - 4])
+                    self.stdscr.addstr(row + i, w - 1, "│")
+                else:
+                    self.stdscr.addstr(row + i, 0, "│" + " " * (w - 2) + "│")
+            row += log_rows
+
+            # Close log box — last row, handle curses.error on bottom-right cell
+            if row < h:
+                try:
+                    self.stdscr.addstr(row, 0, "└" + "─" * (w - 2) + "┘")
+                except curses.error:
+                    pass
 
         except curses.error:
             pass
 
         self.stdscr.refresh()
 
-    def get_input(self, prompt):
-        """Get user input within the curses TUI."""
+    def get_input(self, prompt, timeout_ms=None):
+        """Get user input within the curses TUI.
+
+        If timeout_ms is set, use non-blocking input with that refresh interval
+        and return None if no input is submitted (call again to continue).
+        """
+        curses.flushinp()
         self.input_prompt = prompt
         self.input_value = ""
         self.input_active = True
         self.draw()
 
-        self.stdscr.nodelay(False)
+        if timeout_ms is None:
+            self.stdscr.nodelay(False)
+        else:
+            self.stdscr.nodelay(True)
         curses.echo()
 
         result = []
@@ -226,6 +257,11 @@ class CursesTUI:
             try:
                 ch = self.stdscr.getch()
             except curses.error:
+                ch = -1
+            if ch == -1:
+                if timeout_ms is not None:
+                    curses.noecho()
+                    return None  # No input yet
                 continue
             if ch in (curses.KEY_ENTER, 10, 13):
                 break
@@ -245,12 +281,69 @@ class CursesTUI:
         self.draw()
         return "".join(result).strip()
 
+    def get_input_nonblocking(self, prompt):
+        """Collect input character by character without blocking.
+
+        Call repeatedly from an event loop. Returns the final string when
+        the user presses Enter, or None while still typing.
+        """
+        if not self.input_active:
+            self.input_prompt = prompt
+            self.input_value = ""
+            self.input_active = True
+            self._input_buf = []
+            self.stdscr.nodelay(True)
+            self.draw()
+
+        # Drain all available characters
+        while True:
+            try:
+                ch = self.stdscr.getch()
+            except curses.error:
+                ch = -1
+
+            if ch == -1:
+                return None
+            if ch in (curses.KEY_ENTER, 10, 13):
+                self.input_active = False
+                result = "".join(self._input_buf).strip()
+                self._input_buf = []
+                self.draw()
+                return result
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if self._input_buf:
+                    self._input_buf.pop()
+                    self.input_value = "".join(self._input_buf)
+                    self.draw()
+            elif 32 <= ch < 127:
+                self._input_buf.append(chr(ch))
+                self.input_value = "".join(self._input_buf)
+                self.draw()
+
     def get_confirm(self, prompt, default=True):
-        """Get Y/n confirmation."""
-        resp = self.get_input(prompt)
-        if not resp:
-            return default
-        return resp.lower().startswith("y")
+        """Get Y/n confirmation via single keypress."""
+        curses.flushinp()
+        self.input_prompt = prompt
+        self.input_value = "Press Y to accept, N to reject"
+        self.input_active = True
+        self.draw()
+        self.stdscr.nodelay(False)
+        curses.noecho()
+        while True:
+            try:
+                ch = self.stdscr.getch()
+            except curses.error:
+                continue
+            if ch in (ord("n"), ord("N")):
+                self.input_active = False
+                self.input_value = ""
+                self.draw()
+                return False
+            if ch in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
+                self.input_active = False
+                self.input_value = ""
+                self.draw()
+                return True
 
     def close(self):
         self.db.close()
@@ -288,12 +381,47 @@ def detect_media_type(device_path):
     return None
 
 
+def _preview_resolve(tui, text):
+    """Try to resolve input to a game title for display. Returns title or raw text."""
+    candidate = text.strip()
+    # Normalize serial without hyphen
+    if SERIAL_RE.match(candidate):
+        serial = candidate.upper()
+        if '-' not in serial:
+            serial = serial[:4] + '-' + serial[4:]
+        info = lookup_serial(tui.db, serial)
+        if info:
+            return info["title"]
+    # Try 5-digit shortcut
+    if re.match(r'^\d{5}$', candidate) and tui.last_region:
+        prefixes = tui.db.execute(
+            "SELECT DISTINCT substr(serial, 1, 5) || '-' FROM games WHERE region = ?",
+            (tui.last_region,),
+        ).fetchall()
+        for (prefix,) in prefixes:
+            serial = f"{prefix}{candidate}"
+            info = lookup_serial(tui.db, serial)
+            if info:
+                return info["title"]
+    return candidate
+
+
 def wait_for_disc(tui, device_path):
-    """Wait for a disc insertion event using pyudev, or detect one already present."""
-    tui.set_status("Waiting for disc...", CursesTUI.COLOR_NORMAL)
+    """Wait for a disc insertion event using pyudev, or detect one already present.
+
+    While waiting, the user can type a game code / title. If they submit
+    input before the disc arrives it is stored in tui.pre_input.
+    """
+    tui.set_status("Waiting for disc... (type code/title now or after insert)", CursesTUI.COLOR_NORMAL)
     tui.media = "--"
     tui.game_info = "--"
     tui.set_progress(0.0)
+    tui.pre_input = None
+    tui.disc_name = ""
+    tui.input_prompt = "Enter game code or custom title: "
+    tui.input_active = True
+    tui._input_buf = []
+    tui.input_value = ""
     tui.draw()
 
     # Check if a disc is already in the drive
@@ -307,21 +435,89 @@ def wait_for_disc(tui, device_path):
     monitor = pyudev.Monitor.from_netlink(ctx)
     monitor.filter_by(subsystem="block")
 
-    # Set a short poll timeout so we can check for user input (q to quit)
     tui.stdscr.nodelay(True)
-    for device in iter(monitor.poll, None):
-        # Check for quit
+    _confirming = False  # True when waiting for Y/N after resolve
+    while True:
+        # Poll udev with a short timeout so we can check keyboard regularly
+        device = monitor.poll(timeout=0.1)
+
+        # Check for keyboard input
         try:
             ch = tui.stdscr.getch()
-            if ch == ord("q"):
-                return False
+            while ch != -1:
+                if _confirming:
+                    # Waiting for Y/N confirmation
+                    if ch in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
+                        # Accepted
+                        _confirming = False
+                        tui.input_prompt = "Enter game code or custom title: "
+                        tui.input_active = False
+                        tui.input_value = ""
+                        tui.add_log(f"Confirmed: {tui.disc_name}")
+                        tui.draw()
+                    elif ch in (ord("n"), ord("N")):
+                        # Rejected — re-enter
+                        _confirming = False
+                        tui.pre_input = None
+                        tui.disc_name = ""
+                        tui.input_prompt = "Enter game code or custom title: "
+                        tui.input_active = True
+                        tui._input_buf = []
+                        tui.input_value = ""
+                        tui.draw()
+                elif ch == ord("q") and not tui.input_active:
+                    return False
+                elif tui.input_active:
+                    if ch in (curses.KEY_ENTER, 10, 13):
+                        tui.pre_input = "".join(tui._input_buf).strip()
+                        tui._input_buf = []
+                        if tui.pre_input:
+                            resolved_name = _preview_resolve(tui, tui.pre_input)
+                            tui.disc_name = resolved_name
+                            tui.add_log(f"Detected: {resolved_name}")
+                            # Switch to confirmation mode
+                            _confirming = True
+                            tui.input_prompt = f"Detected: {resolved_name}"
+                            tui.input_value = "Y/n?"
+                            tui.input_active = True
+                            # Flush remaining input to avoid auto-accept
+                            curses.flushinp()
+                            tui.draw()
+                            break
+                        else:
+                            tui.input_active = False
+                        tui.draw()
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        if tui._input_buf:
+                            tui._input_buf.pop()
+                            tui.input_value = "".join(tui._input_buf)
+                            tui.draw()
+                    elif 32 <= ch < 127:
+                        tui._input_buf.append(chr(ch))
+                        tui.input_value = "".join(tui._input_buf)
+                        tui.draw()
+                else:
+                    # Input already confirmed, re-activate on any printable key
+                    if 32 <= ch < 127:
+                        tui.input_active = True
+                        tui._input_buf = [chr(ch)]
+                        tui.input_value = chr(ch)
+                        tui.pre_input = None
+                        tui.disc_name = ""
+                        tui.draw()
+                ch = tui.stdscr.getch()
         except curses.error:
             pass
 
-        if device.action == "change" and device.device_node == device_path:
+        if device and device.properties.get('ACTION') == "change" and device.properties.get('DEVNAME') == device_path:
             media = detect_media_type(device_path)
             if media:
                 tui.media = media
+                # If confirming, accept what was detected
+                if _confirming:
+                    _confirming = False
+                    tui.input_active = False
+                # Don't auto-submit mid-typing — leave input alone for user to finish
                 tui.set_status(f"Disc detected ({media})", CursesTUI.COLOR_WARN)
                 return True
 
@@ -363,7 +559,7 @@ def dump_ps1(tui, device_path, basename, output_dir):
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0,
+            bufsize=0, stdin=subprocess.DEVNULL, start_new_session=True,
         )
         make_non_blocking(proc.stdout.fileno())
 
@@ -386,6 +582,7 @@ def dump_ps1(tui, device_path, basename, output_dir):
                                 buf = buf[idx + 1:]
                                 break
                         line = line_bytes.decode("utf-8", errors="replace").strip()
+                        line = ANSI_ESC_RE.sub("", line).strip()
                         if not line:
                             continue
                         logf.write(line + "\n")
@@ -424,7 +621,7 @@ def dump_ps1(tui, device_path, basename, output_dir):
             remaining = proc.stdout.read()
             if remaining:
                 for line in remaining.decode("utf-8", errors="replace").splitlines():
-                    line = line.strip()
+                    line = ANSI_ESC_RE.sub("", line).strip()
                     if line:
                         logf.write(line + "\n")
                         if "L-EC error" in line.lower():
@@ -482,7 +679,7 @@ def dump_ps2(tui, device_path, basename, output_dir):
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0,
+            bufsize=0, stdin=subprocess.DEVNULL, start_new_session=True,
         )
         make_non_blocking(proc.stderr.fileno())
 
@@ -504,6 +701,7 @@ def dump_ps2(tui, device_path, basename, output_dir):
                                 buf = buf[idx + 1:]
                                 break
                         line = line_bytes.decode("utf-8", errors="replace").strip()
+                        line = ANSI_ESC_RE.sub("", line).strip()
                         if not line:
                             continue
                         logf.write(line + "\n")
@@ -532,7 +730,7 @@ def dump_ps2(tui, device_path, basename, output_dir):
             remaining = proc.stderr.read()
             if remaining:
                 for line in remaining.decode("utf-8", errors="replace").splitlines():
-                    line = line.strip()
+                    line = ANSI_ESC_RE.sub("", line).strip()
                     if line:
                         logf.write(line + "\n")
                         tui.add_log(line)
@@ -583,30 +781,18 @@ def build_filename(title, region, serial=None, disc_number=1, total_discs=1, qua
     parts = [title]
     if total_discs > 1:
         parts.append(f"(Disc {disc_number})")
-    parts.append(f"({region})")
     if serial:
         parts.append(f"[{serial}]")
+    parts.append(f"({region})")
     parts.append(quality)
     return sanitize_filename(" ".join(parts))
 
 
-def run_backup_cycle(tui):
-    """Run one complete backup cycle: detect → identify → dump → rename → eject."""
-    output_dir = tui.args.output
+def resolve_user_input(tui, user_input):
+    """Resolve user input into (serial, title, region, disc_number, total_discs).
 
-    # Wait for disc
-    if not wait_for_disc(tui, tui.device):
-        return False  # User quit
-
-    media = tui.media
-
-    # Prompt for game code or custom title
-    user_input = tui.get_input("Enter game code or custom title: ")
-    if not user_input:
-        tui.set_status("No input, skipping...", CursesTUI.COLOR_WARN)
-        eject_disc(tui.device)
-        return True
-
+    Returns None if the user cancelled/skipped.
+    """
     # If user entered exactly 5 digits, try prefixes from the last region
     if re.match(r'^\d{5}$', user_input) and tui.last_region:
         digits = user_input
@@ -614,18 +800,15 @@ def run_backup_cycle(tui):
             "SELECT DISTINCT substr(serial, 1, 5) || '-' FROM games WHERE region = ?",
             (tui.last_region,),
         ).fetchall()
-        found_info = None
         for (prefix,) in prefixes:
             candidate = f"{prefix}{digits}"
-            found_info = lookup_serial(tui.db, candidate)
-            if found_info:
+            if lookup_serial(tui.db, candidate):
                 user_input = candidate
                 tui.add_log(f"Matched {user_input}")
                 break
-        if not found_info:
+        else:
             tui.add_log(f"No match for {digits} in {tui.last_region}")
 
-    # Determine if serial or custom title
     serial = None
     title = None
     region = None
@@ -634,6 +817,9 @@ def run_backup_cycle(tui):
 
     if SERIAL_RE.match(user_input):
         serial = user_input.upper()
+        # Normalize: insert hyphen if missing (e.g. SLES54211 -> SLES-54211)
+        if '-' not in serial:
+            serial = serial[:4] + '-' + serial[4:]
         info = lookup_serial(tui.db, serial)
         if info:
             title = info["title"]
@@ -647,11 +833,11 @@ def run_backup_cycle(tui):
             tui.add_log(f"Serial {serial} not found in database")
             user_input = tui.get_input("Enter full code or game title: ")
             if not user_input:
-                tui.set_status("No input, skipping...", CursesTUI.COLOR_WARN)
-                eject_disc(tui.device)
-                return True
+                return None
             if SERIAL_RE.match(user_input):
                 serial = user_input.upper()
+                if '-' not in serial:
+                    serial = serial[:4] + '-' + serial[4:]
                 info = lookup_serial(tui.db, serial)
                 if info:
                     title = info["title"]
@@ -665,9 +851,7 @@ def run_backup_cycle(tui):
                     tui.add_log(f"Serial {serial} not found in database")
                     title = tui.get_input("Enter game title: ")
                     if not title:
-                        tui.set_status("No title entered, skipping...", CursesTUI.COLOR_WARN)
-                        eject_disc(tui.device)
-                        return True
+                        return None
                     region = tui.get_input("Enter region (e.g., US, UK, JP): ")
                     if not region:
                         region = "US"
@@ -680,54 +864,22 @@ def run_backup_cycle(tui):
                     region = "US"
                 tui.game_info = f"{title}  ({region})"
     else:
-        # Custom title
         title = user_input
         region = tui.get_input("Enter region (e.g., US, UK, JP): ")
         if not region:
             region = "US"
         tui.game_info = f"{title}  ({region})"
 
-    tui.draw()
+    return serial, title, region, disc_number, total_discs
 
-    # Confirm
-    if not tui.get_confirm("Dump? [Y/n]: "):
-        tui.set_status("Skipped by user", CursesTUI.COLOR_WARN)
-        eject_disc(tui.device)
-        return True
 
-    # Construct temp basename (before quality tag)
-    temp_base = build_filename(title, region, serial, disc_number, total_discs, "").rstrip()
-    tui.set_status(f"Dumping {media} disc...", CursesTUI.COLOR_WARN)
-    tui.set_progress(0.0)
-
-    # Dump based on media type: CD → cdrdao (BIN/CUE), DVD → dd (ISO)
-    os.makedirs(output_dir, exist_ok=True)
+def rename_dump(output_dir, media, temp_base, final_base, tui):
+    """Rename temp dump files to their final names."""
     if media == "CD":
-        good = dump_ps1(tui, tui.device, temp_base, output_dir)
-    else:
-        good = dump_ps2(tui, tui.device, temp_base, output_dir)
-
-    # Determine quality tag
-    quality = "[!]" if good else "[b]"
-    if good:
-        tui.set_status("Good dump!", CursesTUI.COLOR_GOOD)
-        tui.add_log("Dump verified: no errors detected")
-    else:
-        tui.set_status("BAD DUMP (errors detected)", CursesTUI.COLOR_BAD)
-        tui.add_log("BAD DUMP: errors found in log")
-
-    tui.set_progress(1.0, "Complete")
-
-    # Build final name and rename
-    final_base = build_filename(title, region, serial, disc_number, total_discs, quality)
-
-    if media == "CD":
-        # Rename .bin, .cue, .toc and update FILE references
         for ext in (".bin", ".cue", ".toc"):
             old_path = os.path.join(output_dir, f"{temp_base}{ext}")
             new_path = os.path.join(output_dir, f"{final_base}{ext}")
             if os.path.exists(old_path):
-                # Update internal FILE refs before renaming
                 if ext in (".cue", ".toc"):
                     update_file_references(old_path, f"{temp_base}.bin", f"{final_base}.bin")
                 os.rename(old_path, new_path)
@@ -738,6 +890,190 @@ def run_backup_cycle(tui):
         if os.path.exists(old_path):
             os.rename(old_path, new_path)
         tui.add_log(f"Output: {final_base}.iso")
+
+
+def run_backup_cycle(tui):
+    """Run one complete backup cycle: detect → dump+identify → rename → eject."""
+    output_dir = tui.args.output
+
+    # Wait for disc
+    if not wait_for_disc(tui, tui.device):
+        return False  # User quit
+
+    media = tui.media
+
+    # Start dumping immediately with a temp name
+    temp_base = "_pscopy_temp"
+    tui.set_status(f"Dumping {media} disc...", CursesTUI.COLOR_WARN)
+    tui.set_progress(0.0)
+    os.makedirs(output_dir, exist_ok=True)
+
+    dump_result = {}
+
+    def _dump_thread():
+        if media == "CD":
+            dump_result["good"] = dump_ps1(tui, tui.device, temp_base, output_dir)
+        else:
+            dump_result["good"] = dump_ps2(tui, tui.device, temp_base, output_dir)
+
+    dump_thread = threading.Thread(target=_dump_thread, daemon=True)
+    dump_thread.start()
+
+    # Use pre-entered input if available, otherwise collect while dumping
+    user_input = getattr(tui, 'pre_input', None) or None
+    if user_input:
+        tui.disc_name = _preview_resolve(tui, user_input)
+        tui.draw()
+        tui.add_log(f"Using pre-entered: {user_input}")
+    else:
+        tui.add_log("Type game code or title while dump runs...")
+        while dump_thread.is_alive():
+            result = tui.get_input_nonblocking("Enter game code or custom title: ")
+            if result is not None:
+                user_input = result
+                tui.disc_name = _preview_resolve(tui, user_input)
+                tui.draw()
+                break
+            time.sleep(0.05)
+            tui.draw()
+
+    # If input was entered before dump finished, resolve now while dump continues
+    if user_input and dump_thread.is_alive():
+        # Resolve and confirm while dump runs in background
+        while True:
+            resolved = resolve_user_input(tui, user_input)
+            if resolved is None:
+                user_input = None
+                break
+            serial, title, region, disc_number, total_discs = resolved
+            tui.disc_name = title
+            tui.draw()
+            if tui.get_confirm(f"Use \"{title}\"? [Y/n] "):
+                break
+            user_input = tui.get_input("Enter game code or custom title: ")
+            if not user_input:
+                user_input = None
+                break
+        # Wait for dump to finish while keeping UI alive
+        while dump_thread.is_alive():
+            time.sleep(0.1)
+            tui.draw()
+        dump_thread.join()
+        if user_input is None:
+            tui.set_status("No input, skipping...", CursesTUI.COLOR_WARN)
+            for ext in (".bin", ".cue", ".toc", ".iso"):
+                p = os.path.join(output_dir, f"{temp_base}{ext}")
+                if os.path.exists(p):
+                    os.remove(p)
+            eject_disc(tui.device)
+            return True
+        # Already resolved and confirmed — skip to quality check
+        good = dump_result.get("good", False)
+        quality = "[!]" if good else "[b]"
+        if good:
+            tui.set_status("Good dump!", CursesTUI.COLOR_GOOD)
+            tui.add_log("Dump verified: no errors detected")
+        else:
+            tui.set_status("BAD DUMP (errors detected)", CursesTUI.COLOR_BAD)
+            tui.add_log("BAD DUMP: errors found in log")
+        tui.set_progress(1.0, "Complete")
+        final_base = build_filename(title, region, serial, disc_number, total_discs, quality)
+        rename_dump(output_dir, media, temp_base, final_base, tui)
+        eject_disc(tui.device)
+        tui.add_log("Disc ejected")
+        return True
+
+    # If dump finished before input, wait for input normally
+    dump_thread.join()
+
+    if user_input is None and not tui.input_active:
+        # No typing started — show blocking prompt
+        user_input = tui.get_input("Enter game code or custom title: ")
+        if user_input:
+            tui.disc_name = _preview_resolve(tui, user_input)
+            tui.draw()
+    elif user_input is None and tui.input_active:
+        # User was mid-typing when dump finished — keep their buffer, switch to blocking
+        tui.stdscr.nodelay(False)
+        while True:
+            try:
+                ch = tui.stdscr.getch()
+            except curses.error:
+                continue
+            if ch in (curses.KEY_ENTER, 10, 13):
+                user_input = "".join(tui._input_buf).strip()
+                tui.input_active = False
+                tui._input_buf = []
+                if user_input:
+                    tui.disc_name = _preview_resolve(tui, user_input)
+                tui.draw()
+                break
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                if tui._input_buf:
+                    tui._input_buf.pop()
+                    tui.input_value = "".join(tui._input_buf)
+                    tui.draw()
+            elif 32 <= ch < 127:
+                tui._input_buf.append(chr(ch))
+                tui.input_value = "".join(tui._input_buf)
+                tui.draw()
+        tui.stdscr.nodelay(True)
+
+    if not user_input:
+        tui.set_status("No input, skipping...", CursesTUI.COLOR_WARN)
+        # Clean up temp files
+        for ext in (".bin", ".cue", ".toc", ".iso"):
+            p = os.path.join(output_dir, f"{temp_base}{ext}")
+            if os.path.exists(p):
+                os.remove(p)
+        eject_disc(tui.device)
+        return True
+
+    while True:
+        resolved = resolve_user_input(tui, user_input)
+        if resolved is None:
+            tui.set_status("Skipped...", CursesTUI.COLOR_WARN)
+            for ext in (".bin", ".cue", ".toc", ".iso"):
+                p = os.path.join(output_dir, f"{temp_base}{ext}")
+                if os.path.exists(p):
+                    os.remove(p)
+            eject_disc(tui.device)
+            return True
+
+        serial, title, region, disc_number, total_discs = resolved
+        tui.disc_name = title
+        tui.draw()
+
+        # Confirm resolved title
+        if tui.get_confirm(f"Use \"{title}\"? [Y/n] "):
+            break
+
+        # User rejected — let them re-enter
+        user_input = tui.get_input("Enter game code or custom title: ")
+        if not user_input:
+            tui.set_status("No input, skipping...", CursesTUI.COLOR_WARN)
+            for ext in (".bin", ".cue", ".toc", ".iso"):
+                p = os.path.join(output_dir, f"{temp_base}{ext}")
+                if os.path.exists(p):
+                    os.remove(p)
+            eject_disc(tui.device)
+            return True
+
+    # Determine quality tag
+    good = dump_result.get("good", False)
+    quality = "[!]" if good else "[b]"
+    if good:
+        tui.set_status("Good dump!", CursesTUI.COLOR_GOOD)
+        tui.add_log("Dump verified: no errors detected")
+    else:
+        tui.set_status("BAD DUMP (errors detected)", CursesTUI.COLOR_BAD)
+        tui.add_log("BAD DUMP: errors found in log")
+
+    tui.set_progress(1.0, "Complete")
+
+    # Rename temp files to final names
+    final_base = build_filename(title, region, serial, disc_number, total_discs, quality)
+    rename_dump(output_dir, media, temp_base, final_base, tui)
 
     # Eject
     eject_disc(tui.device)

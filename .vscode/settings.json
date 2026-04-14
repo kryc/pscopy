@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python3 -m py_compile pscopy\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
