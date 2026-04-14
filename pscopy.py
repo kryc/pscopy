@@ -4,6 +4,7 @@
 import argparse
 import curses
 import fcntl
+import hashlib
 import os
 import re
 import select
@@ -164,6 +165,17 @@ def get_disc_size(device_path):
         return int(result.stdout.strip())
     except (subprocess.CalledProcessError, ValueError):
         return 0
+
+
+def disc_fingerprint(device_path, size=32768):
+    """Read the first bytes of a disc and return a hash, or None on failure."""
+    try:
+        h = hashlib.sha256()
+        with open(device_path, "rb") as f:
+            h.update(f.read(size))
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def eject_disc(device_path):
@@ -963,6 +975,17 @@ def run_backup_cycle(tui):
 
     media = tui.media
 
+    # Duplicate disc detection (drive auto-retracted after eject)
+    fp = disc_fingerprint(tui.device)
+    if fp and fp == getattr(tui, 'last_fingerprint', None):
+        tui.add_log("Same disc detected — re-ejecting")
+        tui.set_status("Same disc (drive retracted) — ejecting...",
+                       CursesTUI.COLOR_WARN)
+        tui.draw()
+        time.sleep(1)
+        eject_disc(tui.device)
+        return True
+
     # Start dumping immediately with a temp name
     tui.set_status(f"Dumping {media} disc...", CursesTUI.COLOR_WARN)
     tui.set_progress(0.0)
@@ -1000,6 +1023,7 @@ def run_backup_cycle(tui):
             eject_disc(tui.device)
             return True
         _finish_cycle(tui, dump_result, resolved, output_dir, media)
+        tui.last_fingerprint = fp
         return True
 
     # Dump finished first
@@ -1022,6 +1046,7 @@ def run_backup_cycle(tui):
         return True
 
     _finish_cycle(tui, dump_result, resolved, output_dir, media)
+    tui.last_fingerprint = fp
     return True
 
 
