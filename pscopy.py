@@ -502,6 +502,7 @@ def wait_for_disc(tui, device_path):
     tui.game_info = "--"
     tui.set_progress(0.0)
     tui.pre_input = None
+    tui.pre_confirmed = False
     tui.disc_name = ""
     tui.input_prompt = "Enter game code or custom title: "
     tui.input_active = True
@@ -969,8 +970,13 @@ def run_backup_cycle(tui):
     user_input = _collect_user_input(tui, thread)
 
     # If input entered while dump still running, resolve now
+    pre_confirmed = getattr(tui, 'pre_confirmed', False)
     if user_input and thread.is_alive():
-        resolved = _resolve_and_confirm(tui, user_input)
+        if pre_confirmed:
+            # Already confirmed during wait — just resolve without re-asking
+            resolved = resolve_user_input(tui, user_input)
+        else:
+            resolved = _resolve_and_confirm(tui, user_input)
         while thread.is_alive():
             time.sleep(0.1)
             tui.draw()
@@ -992,7 +998,10 @@ def run_backup_cycle(tui):
         eject_disc(tui.device)
         return True
 
-    resolved = _resolve_and_confirm(tui, user_input)
+    if pre_confirmed:
+        resolved = resolve_user_input(tui, user_input)
+    else:
+        resolved = _resolve_and_confirm(tui, user_input)
     if resolved is None:
         tui.set_status("Skipped...", CursesTUI.COLOR_WARN)
         cleanup_temp_files(output_dir)
