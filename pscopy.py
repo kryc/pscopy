@@ -27,8 +27,6 @@ CDRDAO_TRACK_RE = re.compile(r"length\s+(\d+):(\d+):(\d+)")
 CDRDAO_POS_RE = re.compile(r"(\d+):(\d+):(\d+)")
 # dd progress: "12345678 bytes"
 DD_BYTES_RE = re.compile(r"(\d+)\s+bytes")
-# Filesystem-unsafe characters
-UNSAFE_CHARS = re.compile(r'[/\\:*?"<>|]')
 # ANSI escape sequences and control characters
 ANSI_ESC_RE = re.compile(
     r'\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07]*\x07|\([B0UK]|\)[B0UK]|[>=<])'
@@ -44,6 +42,12 @@ ORPHAN_CSI_RE = re.compile(
 TEMP_BASE = "_pscopy_temp"
 LOG_DIR = os.path.expanduser("~/.pscopy")
 DUMP_EXTENSIONS = (".bin", ".cue", ".toc", ".iso")
+# Windows reserved device names (case-insensitive)
+RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(10)),
+    *(f"LPT{i}" for i in range(10)),
+})
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +57,23 @@ DUMP_EXTENSIONS = (".bin", ".cue", ".toc", ".iso")
 def sanitize_filename(name):
     name = name.replace(" & ", " And ")
     name = name.replace("'", "")
-    return UNSAFE_CHARS.sub("-", name)
+    # Strip control characters (0x00-0x1F, 0x7F)
+    name = re.sub(r'[\x00-\x1f\x7f]', '', name)
+    # Replace filesystem-unsafe characters: / \ : * ? " < > |
+    name = re.sub(r'[/\\:*?"<>|]', '-', name)
+    # Strip leading/trailing dots and spaces (problematic on Windows)
+    name = name.strip('. ')
+    # Collapse multiple spaces or dashes
+    name = re.sub(r' {2,}', ' ', name)
+    name = re.sub(r'-{2,}', '-', name)
+    # Guard against Windows reserved device names
+    stem = name.split('.')[0].upper()
+    if stem in RESERVED_NAMES:
+        name = '_' + name
+    # Ensure non-empty
+    if not name:
+        name = '_unnamed'
+    return name
 
 
 def msf_to_seconds(m, s, _f=0):
@@ -554,6 +574,7 @@ def wait_for_disc(tui, device_path):
                 if confirming:
                     if ch in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
                         confirming = False
+                        tui.pre_confirmed = True
                         tui.input_prompt = "Enter game code or custom title: "
                         tui.input_active = False
                         tui.input_value = ""
