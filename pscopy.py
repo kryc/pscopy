@@ -251,6 +251,7 @@ class CursesTUI:
         self.db = sqlite3.connect(args.db)
         self.last_region = ""
         self._input_buf = []
+        self._draw_lock = threading.Lock()
         self._setup_colors()
 
     def _setup_colors(self):
@@ -301,6 +302,19 @@ class CursesTUI:
         self.stdscr.addstr(row, 0, "│" + " " * (w - 2) + "│")
 
     def draw(self):
+        if not self._draw_lock.acquire(blocking=False):
+            return
+        try:
+            # Handle pending resize
+            if curses.is_term_resized(*self.stdscr.getmaxyx()):
+                y, x = self.stdscr.getmaxyx()
+                curses.resizeterm(y, x)
+                self.stdscr.clear()
+            self._draw_inner()
+        finally:
+            self._draw_lock.release()
+
+    def _draw_inner(self):
         try:
             self.stdscr.erase()
             h, w = self.stdscr.getmaxyx()
@@ -400,6 +414,9 @@ class CursesTUI:
 
         Returns the submitted string on Enter, or None otherwise.
         """
+        if ch == curses.KEY_RESIZE:
+            self.draw()
+            return None
         if ch in (curses.KEY_ENTER, 10, 13):
             self.input_active = False
             result = "".join(self._input_buf).strip()
@@ -493,6 +510,9 @@ class CursesTUI:
                 ch = self.stdscr.getch()
             except curses.error:
                 continue
+            if ch == curses.KEY_RESIZE:
+                self.draw()
+                continue
             if ch in (ord("n"), ord("N")):
                 self.input_active = False
                 self.input_value = ""
@@ -571,6 +591,10 @@ def wait_for_disc(tui, device_path):
         try:
             ch = tui.stdscr.getch()
             while ch != -1:
+                if ch == curses.KEY_RESIZE:
+                    tui.draw()
+                    ch = tui.stdscr.getch()
+                    continue
                 if confirming:
                     if ch in (curses.KEY_ENTER, 10, 13, ord("y"), ord("Y")):
                         confirming = False
