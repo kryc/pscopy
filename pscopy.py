@@ -42,6 +42,22 @@ ORPHAN_CSI_RE = re.compile(
 TEMP_BASE = "_pscopy_temp"
 LOG_DIR = os.path.expanduser("~/.pscopy")
 DUMP_EXTENSIONS = (".bin", ".cue", ".toc", ".iso")
+
+# Edition suffixes appended to input codes
+EDITION_SUFFIXES = {
+    "/p": "Platinum",
+    "/gh": "Greatest Hits",
+    "/ce": "Collectors Edition",
+}
+
+
+def parse_edition(text):
+    """Split trailing edition suffix from input. Returns (clean_text, edition_or_empty)."""
+    lower = text.rstrip().lower()
+    for suffix, label in EDITION_SUFFIXES.items():
+        if lower.endswith(suffix):
+            return text[:len(text) - len(suffix)].rstrip(), label
+    return text, ""
 # Windows reserved device names (case-insensitive)
 RESERVED_NAMES = frozenset({
     "CON", "PRN", "AUX", "NUL",
@@ -117,9 +133,11 @@ def cleanup_temp_files(output_dir):
             os.remove(p)
 
 
-def build_filename(title, region, serial=None, disc_number=1, total_discs=1, quality="[!]"):
+def build_filename(title, region, serial=None, disc_number=1, total_discs=1, quality="[!]", edition=""):
     """Build the output filename (without extension)."""
     parts = [title]
+    if edition:
+        parts.append(f"({edition})")
     if total_discs > 1:
         parts.append(f"(Disc {disc_number})")
     if serial:
@@ -374,7 +392,7 @@ class CursesTUI:
                 self._box_empty(row, w)
             row += 1
 
-            disc_label = f"Disc name: {self.disc_name}" if self.disc_name else "Disc name:"
+            disc_label = f"Output: {self.disc_name}" if self.disc_name else "Output:"
             self._box_row(row, w, disc_label)
             row += 1
 
@@ -533,22 +551,30 @@ class CursesTUI:
 # ---------------------------------------------------------------------------
 
 def _preview_resolve(tui, text):
-    """Try to resolve input to a game title for display. Returns title or raw text."""
-    candidate = text.strip()
+    """Try to resolve input to a preview output filename. Returns filename or raw text."""
+    candidate, edition = parse_edition(text.strip())
+    info = None
     if SERIAL_RE.match(candidate):
-        info = lookup_serial(tui.db, normalize_serial(candidate))
-        if info:
-            return info["title"]
-    if re.match(r"^\d{5}$", candidate) and tui.last_region:
+        serial = normalize_serial(candidate)
+        info = lookup_serial(tui.db, serial)
+    elif re.match(r"^\d{5}$", candidate) and tui.last_region:
         prefixes = tui.db.execute(
             "SELECT DISTINCT substr(serial, 1, 4) || '-' FROM games WHERE region = ?",
             (tui.last_region,),
         ).fetchall()
         for (prefix,) in prefixes:
-            info = lookup_serial(tui.db, f"{prefix}{candidate}")
+            serial = f"{prefix}{candidate}"
+            info = lookup_serial(tui.db, serial)
             if info:
-                return info["title"]
-    return candidate
+                break
+    if info:
+        return build_filename(
+            info["title"], region_code(info["region"]),
+            serial, info["disc_number"], info["total_discs"],
+            edition=edition,
+        )
+    suffix = f" ({edition})" if edition else ""
+    return candidate + suffix
 
 
 # ---------------------------------------------------------------------------
@@ -847,10 +873,12 @@ def dump_ps2(tui, device_path, basename, output_dir):
 # ---------------------------------------------------------------------------
 
 def resolve_user_input(tui, user_input):
-    """Resolve user input into (serial, title, region, disc_number, total_discs).
+    """Resolve user input into (serial, title, region, disc_number, total_discs, edition).
 
     Returns None if the user cancelled/skipped.
     """
+    user_input, edition = parse_edition(user_input)
+
     # 5-digit shortcut: try region-specific prefixes
     if re.match(r"^\d{5}$", user_input) and tui.last_region:
         digits = user_input
@@ -892,7 +920,7 @@ def resolve_user_input(tui, user_input):
                          f"Disc {disc_number}/{total_discs}  ({region})")
         tui.add_log(f"Found in DB: {title} ({info['region']})")
         tui.last_region = info["region"]
-        return serial, title, region, disc_number, total_discs
+        return serial, title, region, disc_number, total_discs, edition
 
     # Not found — manual entry
     if serial:
@@ -910,7 +938,7 @@ def resolve_user_input(tui, user_input):
         tui.game_info = f"{title}  [{serial}]  ({region})"
     else:
         tui.game_info = f"{title}  ({region})"
-    return serial, title, region, 1, 1
+    return serial, title, region, 1, 1, edition
 
 
 def rename_dump(output_dir, media, final_base, tui):
@@ -992,7 +1020,7 @@ def _collect_user_input(tui, dump_thread):
 
 def _finish_cycle(tui, dump_result, resolved, output_dir, media):
     """Quality check → rename → eject."""
-    serial, title, region, disc_number, total_discs = resolved
+    serial, title, region, disc_number, total_discs, edition = resolved
     good = dump_result.get("good", False)
     quality = "[!]" if good else "[b]"
 
@@ -1005,7 +1033,7 @@ def _finish_cycle(tui, dump_result, resolved, output_dir, media):
 
     tui.set_progress(1.0, "Complete")
     final_base = build_filename(title, region, serial, disc_number,
-                                total_discs, quality)
+                                total_discs, quality, edition)
     rename_dump(output_dir, media, final_base, tui)
     eject_disc(tui.device)
     tui.add_log("Disc ejected")
